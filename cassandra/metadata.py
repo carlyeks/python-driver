@@ -88,7 +88,7 @@ class Metadata(object):
         """
         return "\n".join(ks.export_as_string() for ks in self.keyspaces.values())
 
-    def rebuild_schema(self, ks_results, type_results, cf_results, col_results, triggers_result):
+    def rebuild_schema(self, ks_results, type_results, cf_results, col_results, triggers_result, global_index_results):
         """
         Rebuild the view of the current schema from a fresh set of rows from
         the system schema tables.
@@ -99,6 +99,7 @@ class Metadata(object):
         col_def_rows = defaultdict(lambda: defaultdict(list))
         usertype_rows = defaultdict(list)
         trigger_rows = defaultdict(lambda: defaultdict(list))
+        global_index_rows = defaultdict(lambda: defaultdict(list))
 
         for row in cf_results:
             cf_def_rows[row["keyspace_name"]].append(row)
@@ -116,15 +117,21 @@ class Metadata(object):
             cfname = row["columnfamily_name"]
             trigger_rows[ksname][cfname].append(row)
 
+        for row in global_index_results:
+            ksname = row["keyspace_name"]
+            cfname = row["columnfamily_name"]
+            global_index_rows[ksname][cfname].append(row)
+
         current_keyspaces = set()
         for row in ks_results:
             keyspace_meta = self._build_keyspace_metadata(row)
             keyspace_col_rows = col_def_rows.get(keyspace_meta.name, {})
             keyspace_trigger_rows = trigger_rows.get(keyspace_meta.name, {})
+            keyspace_global_indexes = global_index_rows.get(keyspace_meta.name, {})
             for table_row in cf_def_rows.get(keyspace_meta.name, []):
                 table_meta = self._build_table_metadata(
                     keyspace_meta, table_row, keyspace_col_rows,
-                    keyspace_trigger_rows)
+                    keyspace_trigger_rows, keyspace_global_indexes)
                 keyspace_meta.tables[table_meta.name] = table_meta
 
             for usertype_row in usertype_rows.get(keyspace_meta.name, []):
@@ -173,7 +180,7 @@ class Metadata(object):
             # the type was deleted
             self.keyspaces[keyspace].user_types.pop(name, None)
 
-    def table_changed(self, keyspace, table, cf_results, col_results, triggers_result):
+    def table_changed(self, keyspace, table, cf_results, col_results, triggers_result, global_indexes_result):
         try:
             keyspace_meta = self.keyspaces[keyspace]
         except KeyError:
@@ -189,7 +196,7 @@ class Metadata(object):
             assert len(cf_results) == 1
             keyspace_meta.tables[table] = self._build_table_metadata(
                 keyspace_meta, cf_results[0], {table: col_results},
-                {table: triggers_result})
+                {table: triggers_result}, {global_indexes_result: global_indexes_result})
 
     def _keyspace_added(self, ksname):
         if self.token_map:
@@ -215,7 +222,7 @@ class Metadata(object):
         return UserType(usertype_row['keyspace_name'], usertype_row['type_name'],
                         usertype_row['field_names'], type_classes)
 
-    def _build_table_metadata(self, keyspace_metadata, row, col_rows, trigger_rows):
+    def _build_table_metadata(self, keyspace_metadata, row, col_rows, trigger_rows, global_index_rows):
         cfname = row["columnfamily_name"]
         cf_col_rows = col_rows.get(cfname, [])
 
@@ -358,6 +365,11 @@ class Metadata(object):
                 trigger_meta = self._build_trigger_metadata(table_meta, trigger_row)
                 table_meta.triggers[trigger_meta.name] = trigger_meta
 
+        if global_index_rows:
+            for global_index_row in global_index_rows[cfname]:
+                global_index_meta = self._build_global_index_metadata(table_meta, global_index_row)
+                table_meta.global_indexes[global_index_meta.name] = global_index_meta
+
         table_meta.options = self._build_table_options(row)
         table_meta.is_compact_storage = is_compact
 
@@ -402,6 +414,13 @@ class Metadata(object):
         options = row["trigger_options"]
         trigger_meta = TriggerMetadata(table_metadata, name, options)
         return trigger_meta
+    
+    def _build_global_index_metadata(self, table_metadata, row):
+        name = row["index_name"]
+        indexed_column = row["indexed_column"]
+        include_columns = row["included_columns"]
+        global_index_meta = GlobalIndexMetadata(table_metadata, name, indexed_column, include_columns)
+        return global_index_meta
 
     def rebuild_token_map(self, partitioner, token_map):
         """
@@ -927,6 +946,11 @@ class TableMetadata(object):
     A dict mapping trigger names to :class:`.TriggerMetadata` instances.
     """
 
+    global_indexes = None
+    """
+    A dict mapping global index names to :class:`.GlobalIndexMetadata` instances.
+    """
+
     @property
     def is_cql_compatible(self):
         """
@@ -939,7 +963,7 @@ class TableMetadata(object):
 
         return not incompatible
 
-    def __init__(self, keyspace_metadata, name, partition_key=None, clustering_key=None, columns=None, triggers=None, options=None):
+    def __init__(self, keyspace_metadata, name, partition_key=None, clustering_key=None, columns=None, triggers=None, global_indexes=None, options=None):
         self.keyspace = keyspace_metadata
         self.name = name
         self.partition_key = [] if partition_key is None else partition_key
@@ -948,6 +972,7 @@ class TableMetadata(object):
         self.options = options
         self.comparator = None
         self.triggers = OrderedDict() if triggers is None else triggers
+        self.global_indexes = OrderedDict() if global_indexes is None else global_indexes
 
     def export_as_string(self):
         """
@@ -1436,5 +1461,39 @@ class TriggerMetadata(object):
             protect_name(self.table.keyspace.name),
             protect_name(self.table.name),
             protect_value(self.options['class'])
+        )
+        return ret
+
+
+class GlobalIndexMetadata(object):
+    """
+    A representation of a global index for a table.
+    """
+
+    table = None
+    """ The :class:`.TableMetadata` this global index belongs to. """
+
+    name = None
+    """ The string name of this global index. """
+
+    indexed_column = None
+    """ The column this global index is defined on. """
+
+    include_columns = None
+    """ The columns which are included in the global index."""
+    
+    def __init__(self, table_metadata, index_name, indexed_column, include_columns):
+        self.table = table_metadata
+        self.name = index_name
+        self.indexed_column = indexed_column
+        self.include_columns = include_columns
+
+    def as_cql_query(self):
+        ret = "CREATE GLOBAL INDEX %s ON %s.%s (%s) INCLUDE (%s)" % (
+            protect_name(self.name),
+            protect_name(self.table.keyspace.name),
+            protect_name(self.table.name),
+            protect_value(self.indexed_column),
+            protect_value(self.include_columns)
         )
         return ret

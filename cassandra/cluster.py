@@ -1820,6 +1820,7 @@ class ControlConnection(object):
     _SELECT_COLUMNS = "SELECT * FROM system.schema_columns"
     _SELECT_USERTYPES = "SELECT * FROM system.schema_usertypes"
     _SELECT_TRIGGERS = "SELECT * FROM system.schema_triggers"
+    _SELECT_GLOBAL_INDEXES = "SELECT * FROM system.schema_globalindexes"
 
     _SELECT_PEERS = "SELECT peer, data_center, rack, tokens, rpc_address, schema_version FROM system.peers"
     _SELECT_LOCAL = "SELECT cluster_name, data_center, rack, tokens, partitioner, schema_version FROM system.local WHERE key='local'"
@@ -2050,8 +2051,9 @@ class ControlConnection(object):
             cf_query = QueryMessage(query=self._SELECT_COLUMN_FAMILIES + where_clause, consistency_level=cl)
             col_query = QueryMessage(query=self._SELECT_COLUMNS + where_clause, consistency_level=cl)
             triggers_query = QueryMessage(query=self._SELECT_TRIGGERS + where_clause, consistency_level=cl)
-            (cf_success, cf_result), (col_success, col_result), (triggers_success, triggers_result) \
-                = connection.wait_for_responses(cf_query, col_query, triggers_query, timeout=self._timeout, fail_on_error=False)
+            global_indexes_query = QueryMessage(query=self._SELECT_GLOBAL_INDEXES + where_clause, consistency_level=cl)
+            (cf_success, cf_result), (col_success, col_result), (triggers_success, triggers_result), (global_indexes_success, global_indexes_result) \
+                = connection.wait_for_responses(cf_query, col_query, triggers_query, global_indexes_query, timeout=self._timeout, fail_on_error=False)
 
             log.debug("[control connection] Fetched table info for %s.%s, rebuilding metadata", keyspace, table)
             cf_result = _handle_results(cf_success, cf_result)
@@ -2063,7 +2065,12 @@ class ControlConnection(object):
             else:
                 triggers_result = _handle_results(triggers_success, triggers_result)
 
-            self._cluster.metadata.table_changed(keyspace, table, cf_result, col_result, triggers_result)
+            if not global_indexes_success and isinstance(global_indexes_result, InvalidRequerst):
+                global_indexes_result = {}
+            else:
+                global_indexes_result = _handle_results(global_indexes_success, global_indexes_result)
+
+            self._cluster.metadata.table_changed(keyspace, table, cf_result, col_result, triggers_result, global_indexes_result)
         elif usertype:
             # user defined types within this keyspace changed
             where_clause = " WHERE keyspace_name = '%s' AND type_name = '%s'" % (keyspace, usertype)
@@ -2087,13 +2094,14 @@ class ControlConnection(object):
                 QueryMessage(query=self._SELECT_COLUMN_FAMILIES, consistency_level=cl),
                 QueryMessage(query=self._SELECT_COLUMNS, consistency_level=cl),
                 QueryMessage(query=self._SELECT_USERTYPES, consistency_level=cl),
-                QueryMessage(query=self._SELECT_TRIGGERS, consistency_level=cl)
+                QueryMessage(query=self._SELECT_TRIGGERS, consistency_level=cl),
+                QueryMessage(query=self._SELECT_GLOBAL_INDEXES, consistency_level=cl)
             ]
 
             responses = connection.wait_for_responses(*queries, timeout=self._timeout, fail_on_error=False)
             (ks_success, ks_result), (cf_success, cf_result), \
                 (col_success, col_result), (types_success, types_result), \
-                (trigger_success, triggers_result) = responses
+                (trigger_success, triggers_result), (global_indexes_success, global_indexes_result) = responses
 
             if ks_success:
                 ks_result = dict_factory(*ks_result.results)
@@ -2134,8 +2142,17 @@ class ControlConnection(object):
                 else:
                     raise types_result
 
+            if global_indexes_success:
+                global_indexes_result = dict_factory(*global_indexes_result.results) if global_indexes_result.results else {}
+            else:
+                if isinstance(global_indexes_result, InvalidRequest):
+                    log.debug("[control connection] global indexes table not found")
+                    global_indexes_result = {}
+                else:
+                    raise global_indexes_result
+
             log.debug("[control connection] Fetched schema, rebuilding metadata")
-            self._cluster.metadata.rebuild_schema(ks_result, types_result, cf_result, col_result, triggers_result)
+            self._cluster.metadata.rebuild_schema(ks_result, types_result, cf_result, col_result, triggers_result, global_indexes_result)
         return True
 
     def refresh_node_list_and_token_map(self, force_token_rebuild=False):
